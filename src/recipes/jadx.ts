@@ -68,12 +68,14 @@ async function resolveJadxLauncher(ctx: InstallContext): Promise<string> {
   const cached = await findLauncherIn(managed, name, 2);
   if (cached) return cached;
 
-  // Download the official release. Windows ships a GUI bundle; other platforms
-  // use the cross-platform zip. Both contain bin/jadx[.bat]. (Assumes current
-  // skylot/jadx asset names: jadx-gui-<ver>-win.zip and jadx-<ver>.zip.)
+  // Download the official release. Prefer the cross-platform `jadx-<ver>.zip`:
+  // it is the only asset that ships the CLI launcher (bin/jadx[.bat]) AND the
+  // GUI launcher (bin/jadx-gui[.bat]). The Windows `jadx-gui-<ver>-win.zip` is a
+  // GUI-only bundle (jadx-gui.exe + lib/) with no bin/jadx.bat, so it cannot
+  // drive the plugin CLI — keep it only as a last-resort fallback.
   const patterns: RegExp[] =
     ctx.platform === "win32"
-      ? [/jadx-gui-.*\.zip$/i, /jadx-\d.*\.zip$/i]
+      ? [/jadx-\d.*\.zip$/i, /jadx-gui-.*\.zip$/i]
       : [/jadx-\d.*\.zip$/i];
 
   ctx.logger.detail("jadx not found — downloading the official release.");
@@ -105,6 +107,32 @@ async function resolveJadxLauncher(ctx: InstallContext): Promise<string> {
     );
   }
   return found;
+}
+
+/**
+ * Resolve the absolute path to the `jadx_mcp_server` executable that
+ * `uv tool install` produced. `uv tool dir --bin` reports the exact directory;
+ * we fall back to the conventional `~/.local/bin`, then to whatever is on PATH,
+ * and finally to the bare name if nothing is found.
+ */
+async function resolveJadxServerCommand(ctx: InstallContext): Promise<string> {
+  const exe = ctx.platform === "win32" ? "jadx_mcp_server.exe" : "jadx_mcp_server";
+
+  const candidateDirs: string[] = [];
+  const res = await ctx.run("uv", ["tool", "dir", "--bin"], { allowFailure: true });
+  if (res.ok) {
+    const dir = res.stdout.trim();
+    if (dir) candidateDirs.push(dir);
+  }
+  candidateDirs.push(path.join(ctx.home, ".local", "bin"));
+
+  for (const dir of candidateDirs) {
+    const full = path.join(dir, exe);
+    if (await exists(full)) return full;
+  }
+
+  const onPath = await which("jadx_mcp_server");
+  return onPath ?? "jadx_mcp_server";
 }
 
 export const jadxRecipe: Recipe = {
@@ -164,8 +192,18 @@ export const jadxRecipe: Recipe = {
       }
     });
 
+    // Emit the absolute path to the installed server: uv's tool bin (e.g.
+    // ~/.local/bin) is frequently not on PATH, so a bare command name fails to
+    // spawn from the client. Fall back to the bare name only if unlocatable.
+    const serverCommand = await resolveJadxServerCommand(ctx);
+    if (serverCommand === "jadx_mcp_server") {
+      notes.push(
+        "Could not locate the installed jadx_mcp_server executable — config uses the bare name, so ensure uv's tool bin (e.g. ~/.local/bin) is on PATH.",
+      );
+    }
+
     return {
-      servers: { jadx: { command: "jadx_mcp_server" } },
+      servers: { jadx: { command: serverCommand } },
       placedFiles: [],
       notes,
     };
