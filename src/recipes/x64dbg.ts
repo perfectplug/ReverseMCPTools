@@ -1,4 +1,5 @@
 import path from "node:path";
+import fsp from "node:fs/promises";
 import type {
   InstallContext,
   Recipe,
@@ -15,6 +16,96 @@ import {
 const PLUGIN_REPO = "SetsunaYukiOvO/x64dbg-mcp";
 const X64DBG_REPO = "x64dbg/x64dbg";
 const PORT = 3000;
+
+/**
+ * The plugin's own generated defaults, but with `auto_start_mcp_on_plugin_load`
+ * turned ON. Without it the HTTP server does NOT start on launch: the user has
+ * to click Plugins -> MCP Server -> Start MCP HTTP Server every time, and the
+ * client shows the server as "failed" until they do. Dangerous operations
+ * (memory/register writes, script execution) stay OFF by default.
+ */
+function defaultPluginConfig(): Record<string, unknown> {
+  return {
+    version: "1.0.9",
+    server: { address: "127.0.0.1", port: PORT },
+    permissions: {
+      allow_memory_write: false,
+      allow_register_write: false,
+      allow_script_execution: false,
+      allow_breakpoint_modification: true,
+      allowed_methods: [
+        "debug.*", "register.*", "memory.*", "breakpoint.*", "disasm.*",
+        "disassembly.*", "module.*", "symbol.*", "thread.*", "stack.*",
+        "comment.*", "context.*", "dump.*", "eval.*", "xref.*", "function.*",
+        "assembler.*", "bookmark.*", "patch.*",
+      ],
+    },
+    security: { origin_allowlist: [], host_allowlist: [] },
+    logging: {
+      enabled: true,
+      level: "info",
+      file: "plugin.log",
+      max_file_size_mb: 10,
+      console_output: true,
+    },
+    timeout: {
+      request_timeout_ms: 30000,
+      step_timeout_ms: 10000,
+      memory_read_timeout_ms: 5000,
+    },
+    features: {
+      enable_notifications: true,
+      enable_heartbeat: true,
+      heartbeat_interval_seconds: 30,
+      enable_batch_requests: true,
+      auto_start_mcp_on_plugin_load: true,
+    },
+  };
+}
+
+/**
+ * The plugin reads its config from `<plugins>/<name>/config.json`, where <name>
+ * is the plugin basename with underscores turned to hyphens (the .dp64
+ * `x64dbg_mcp` -> `x64dbg-mcp`; the .dp32 `x32dbg_mcp` -> `x32dbg-mcp`).
+ */
+function pluginConfigDir(pluginsDir: string, assetName: string): string {
+  const base = assetName.replace(/\.dp\d+$/i, "").replace(/_/g, "-");
+  return path.join(pluginsDir, base);
+}
+
+/**
+ * Ensure the plugin's HTTP server auto-starts. If a config already exists (the
+ * plugin generated one on a prior run, or the user hand-edited it), flip only
+ * the single flag so their other settings survive; otherwise seed the full
+ * default. Returns the config path written, or undefined on failure.
+ */
+async function enableAutoStart(configDir: string): Promise<string | undefined> {
+  const configPath = path.join(configDir, "config.json");
+  try {
+    await ensureDir(configDir);
+    if (await exists(configPath)) {
+      const cfg = JSON.parse(await fsp.readFile(configPath, "utf8")) as Record<
+        string,
+        unknown
+      >;
+      const features =
+        cfg.features && typeof cfg.features === "object"
+          ? (cfg.features as Record<string, unknown>)
+          : {};
+      features.auto_start_mcp_on_plugin_load = true;
+      cfg.features = features;
+      await fsp.writeFile(configPath, JSON.stringify(cfg, null, 2));
+    } else {
+      await fsp.writeFile(
+        configPath,
+        JSON.stringify(defaultPluginConfig(), null, 2),
+      );
+    }
+    return configPath;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Locate an x64dbg install `release` root (the folder containing `x32/` and
@@ -69,7 +160,7 @@ export const x64dbgRecipe: Recipe = {
   async install(ctx: InstallContext): Promise<RecipeInstallResult> {
     if (ctx.dryRun) {
       ctx.logger.detail(
-        "(dry-run) would ensure x64dbg is present and drop the MCP plugin (.dp64/.dp32) into <x64dbg>/release/{x64,x32}/plugins.",
+        "(dry-run) would ensure x64dbg is present, drop the MCP plugin (.dp64/.dp32) into <x64dbg>/release/{x64,x32}/plugins, and enable auto_start_mcp_on_plugin_load in each plugin's config.json.",
       );
       return {
         servers: { x64dbg: { type: "http", url: `http://127.0.0.1:${PORT}/mcp` } },
@@ -79,6 +170,7 @@ export const x64dbgRecipe: Recipe = {
 
     const root = await resolveX64dbgRoot(ctx);
     const placed: string[] = [];
+    const notes: string[] = [];
 
     const targets: { assetRe: RegExp; subdir: string; label: string }[] = [
       { assetRe: /x64dbg_mcp\.dp64$/i, subdir: "x64", label: "x64 (64-bit)" },
@@ -96,11 +188,20 @@ export const x64dbgRecipe: Recipe = {
       await ctx.logger.task(`Download ${t.label} plugin (${asset.tag})`, () =>
         downloadFile(asset.url, download),
       );
-      if (!ctx.dryRun) {
-        await ensureDir(pluginsDir);
-        const dest = path.join(pluginsDir, asset.name);
-        await copyFile(download, dest);
-        placed.push(dest);
+      await ensureDir(pluginsDir);
+      const dest = path.join(pluginsDir, asset.name);
+      await copyFile(download, dest);
+      placed.push(dest);
+
+      // Make the HTTP server start on launch, so the client connects without the
+      // user having to click Plugins -> MCP Server -> Start MCP HTTP Server.
+      const cfg = await enableAutoStart(pluginConfigDir(pluginsDir, asset.name));
+      if (cfg) {
+        placed.push(cfg);
+      } else {
+        notes.push(
+          `Could not write the ${t.label} plugin config — the MCP server will not auto-start. Enable it via Plugins -> MCP Server -> Start MCP HTTP Server, or set features.auto_start_mcp_on_plugin_load=true in the plugin's config.json.`,
+        );
       }
     }
 
@@ -115,13 +216,14 @@ export const x64dbgRecipe: Recipe = {
         x64dbg: { type: "http", url: `http://127.0.0.1:${PORT}/mcp` },
       },
       placedFiles: placed,
+      notes,
     };
   },
 
   postInstallNotes: [
-    "Launch x64dbg (64-bit) or x32dbg (32-bit); the plugin starts an MCP server on 127.0.0.1:3000. Check the Log tab to confirm it loaded.",
-    "The MCP tools only respond while x64dbg is open with a target loaded.",
-    "Memory writes, register writes and script execution are OFF by default. Opt in via the plugin's config.json (under the arch plugins folder) only if you need them.",
+    "Launch x64dbg (64-bit) or x32dbg (32-bit). This installer enabled auto-start, so the plugin brings up the MCP server on 127.0.0.1:3000 automatically at startup — no menu action needed. The Log tab should show 'MCP HTTP Server started'.",
+    "The server only responds while x64dbg is open, and returns live data once you load a target. To disable auto-start, set features.auto_start_mcp_on_plugin_load=false in <x64dbg>/release/<arch>/plugins/<arch>dbg-mcp/config.json (or just start it manually via Plugins -> MCP Server -> Start MCP HTTP Server).",
+    "Memory writes, register writes and script execution are OFF by default. Opt in via the plugin's config.json only if you need them.",
     "For stdio-only clients, this installer bridges the HTTP URL through `npx mcp-remote` automatically (Claude Desktop). Other clients connect to the URL directly.",
     "Run x64dbg inside a VM/sandbox when analysing untrusted binaries — you are giving an AI live debugger control.",
   ],

@@ -6,7 +6,7 @@ import type {
   Recipe,
   RecipeInstallResult,
 } from "../core/types.js";
-import { exists } from "../core/fs-utils.js";
+import { exists, ensureDir } from "../core/fs-utils.js";
 import { which, winCmd } from "../core/exec.js";
 import {
   downloadFile,
@@ -17,7 +17,14 @@ import {
 const JADX_REPO = "skylot/jadx";
 // Plugin ref understood by the jadx CLI plugin installer.
 const PLUGIN_REF = "github:zinja-coder:jadx-ai-mcp";
-const SERVER_PKG = "git+https://github.com/zinja-coder/jadx-mcp-server";
+// The MCP bridge server. It is deliberately NOT installed as a wheel/uv-tool:
+// its pyproject only packages the top-level `jadx_mcp_server.py`
+// (`py-modules = ["jadx_mcp_server"]`), yet that module imports the sibling
+// `src/` package (`from src.banner import ...`). A wheel install therefore
+// crashes at startup with `ModuleNotFoundError: No module named 'src'`. We clone
+// the repo and run it in place with `uv run`, where the repo root is on
+// sys.path[0] so `src` resolves.
+const SERVER_REPO = "https://github.com/zinja-coder/jadx-mcp-server";
 // The plugin serves live decompiler context on this loopback port.
 const PLUGIN_PORT = 8650;
 
@@ -110,29 +117,42 @@ async function resolveJadxLauncher(ctx: InstallContext): Promise<string> {
 }
 
 /**
- * Resolve the absolute path to the `jadx_mcp_server` executable that
- * `uv tool install` produced. `uv tool dir --bin` reports the exact directory;
- * we fall back to the conventional `~/.local/bin`, then to whatever is on PATH,
- * and finally to the bare name if nothing is found.
+ * Resolve an absolute path to the `uv` executable. uv's install dir is often
+ * not on the client's PATH, so we emit the absolute path in the client config
+ * and only fall back to the bare name (relying on PATH) if it cannot be found.
  */
-async function resolveJadxServerCommand(ctx: InstallContext): Promise<string> {
-  const exe = ctx.platform === "win32" ? "jadx_mcp_server.exe" : "jadx_mcp_server";
+async function resolveUvCommand(): Promise<string> {
+  return (await which("uv")) ?? "uv";
+}
 
-  const candidateDirs: string[] = [];
-  const res = await ctx.run("uv", ["tool", "dir", "--bin"], { allowFailure: true });
-  if (res.ok) {
-    const dir = res.stdout.trim();
-    if (dir) candidateDirs.push(dir);
+/**
+ * Clone (or fast-forward) the jadx-mcp-server repo into our managed tools dir
+ * and return its root. The bridge is run from this checkout via `uv run` rather
+ * than installed as a package (see SERVER_REPO note).
+ */
+async function ensureJadxServerRepo(ctx: InstallContext): Promise<string> {
+  const repoDir = path.join(ctx.toolsDir, "jadx-mcp-server");
+  if (await exists(path.join(repoDir, ".git"))) {
+    // Best-effort update; ignore failures (offline / local edits present).
+    await ctx.run("git", ["-C", repoDir, "pull", "--ff-only"], {
+      allowFailure: true,
+    });
+    return repoDir;
   }
-  candidateDirs.push(path.join(ctx.home, ".local", "bin"));
-
-  for (const dir of candidateDirs) {
-    const full = path.join(dir, exe);
-    if (await exists(full)) return full;
-  }
-
-  const onPath = await which("jadx_mcp_server");
-  return onPath ?? "jadx_mcp_server";
+  await ensureDir(ctx.toolsDir);
+  await ctx.logger.task("Clone jadx-mcp-server", async () => {
+    const res = await ctx.run(
+      "git",
+      ["clone", "--depth", "1", SERVER_REPO, repoDir],
+      { allowFailure: true },
+    );
+    if (!res.ok) {
+      throw new Error(
+        `git clone failed: ${res.stderr.trim() || res.stdout.trim() || "unknown error"}`,
+      );
+    }
+  });
+  return repoDir;
 }
 
 export const jadxRecipe: Recipe = {
@@ -148,9 +168,23 @@ export const jadxRecipe: Recipe = {
   async install(ctx: InstallContext): Promise<RecipeInstallResult> {
     if (ctx.dryRun) {
       ctx.logger.detail(
-        "(dry-run) would ensure jadx-gui, install the jadx-ai-mcp plugin, and `uv tool install` jadx_mcp_server.",
+        "(dry-run) would ensure jadx-gui + the jadx-ai-mcp plugin, clone jadx-mcp-server, `uv sync` it, and register `uv --directory <repo> run jadx_mcp_server.py`.",
       );
-      return { servers: { jadx: { command: "jadx_mcp_server" } }, placedFiles: [] };
+      return {
+        servers: {
+          jadx: {
+            type: "stdio",
+            command: "uv",
+            args: [
+              "--directory",
+              path.join(ctx.toolsDir, "jadx-mcp-server"),
+              "run",
+              "jadx_mcp_server.py",
+            ],
+          },
+        },
+        placedFiles: [],
+      };
     }
 
     const notes: string[] = [];
@@ -175,35 +209,45 @@ export const jadxRecipe: Recipe = {
       }
     });
 
-    // 2) Install the Python MCP server globally with uv. This drops a
-    //    `jadx_mcp_server` executable into uv's bin dir (~/.local/bin) on PATH.
-    await ctx.logger.task("Install jadx_mcp_server (uv tool)", async () => {
-      const res = await ctx.run("uv", ["tool", "install", SERVER_PKG], {
+    // 2) Clone the MCP bridge server and pre-sync its venv, so the client's
+    //    first spawn is fast. A cold `uv run` downloads the whole dependency
+    //    set (fastmcp, uvicorn, pywin32, ...) on first launch and can blow the
+    //    client's connect timeout, showing the server as "failed".
+    const repoDir = await ensureJadxServerRepo(ctx);
+    await ctx.logger.task("Prepare jadx_mcp_server env (uv sync)", async () => {
+      const res = await ctx.run("uv", ["--directory", repoDir, "sync"], {
         allowFailure: true,
+        timeoutMs: 300_000,
       });
       if (!res.ok) {
         const why = res.stderr.trim() || res.stdout.trim() || "unknown error";
         ctx.logger.warn(
-          `uv tool install failed (${why}). Retry manually: uv tool install ${SERVER_PKG}`,
+          `uv sync failed (${why}). The server will sync on first launch, which may delay the client's first connection.`,
         );
         notes.push(
-          `jadx_mcp_server install failed — retry with: uv tool install ${SERVER_PKG}`,
+          `jadx_mcp_server env not pre-synced — retry once with: uv --directory ${repoDir} sync`,
         );
       }
     });
 
-    // Emit the absolute path to the installed server: uv's tool bin (e.g.
-    // ~/.local/bin) is frequently not on PATH, so a bare command name fails to
-    // spawn from the client. Fall back to the bare name only if unlocatable.
-    const serverCommand = await resolveJadxServerCommand(ctx);
-    if (serverCommand === "jadx_mcp_server") {
+    // Emit `uv --directory <repo> run jadx_mcp_server.py`: running the entry
+    // script in place puts the repo root on sys.path so the `src` package
+    // resolves, and uv provisions/updates the venv transparently.
+    const uvCmd = await resolveUvCommand();
+    if (uvCmd === "uv") {
       notes.push(
-        "Could not locate the installed jadx_mcp_server executable — config uses the bare name, so ensure uv's tool bin (e.g. ~/.local/bin) is on PATH.",
+        "Could not resolve an absolute path to uv — config uses the bare name, so ensure uv is on PATH for your client.",
       );
     }
 
     return {
-      servers: { jadx: { command: serverCommand } },
+      servers: {
+        jadx: {
+          type: "stdio",
+          command: uvCmd,
+          args: ["--directory", repoDir, "run", "jadx_mcp_server.py"],
+        },
+      },
       placedFiles: [],
       notes,
     };
@@ -213,12 +257,18 @@ export const jadxRecipe: Recipe = {
     "Open jadx-gui and load your APK/DEX/JAR before using the tools. The plugin serves live decompiler context on 127.0.0.1:8650, and the MCP tools return nothing while jadx-gui is closed or has no target loaded.",
     "You need BOTH halves for this to work: the jadx-ai-mcp plugin inside jadx-gui AND the jadx_mcp_server bridge registered in your client.",
     "jadx requires a JRE/JDK 11+ on PATH (JDK 21 installed by this tool satisfies it).",
-    "If your client reports that `jadx_mcp_server` was not found, restart the terminal/client so uv's bin dir (e.g. ~/.local/bin) is on PATH — or point the client at `uv --directory <jadx-mcp-server> run jadx_mcp_server` instead.",
+    "The bridge runs from a cloned checkout via `uv run`, which provisions its own venv. If the client's first connection times out, pre-build the env once: `uv --directory <toolsDir>/jadx-mcp-server sync`.",
   ],
 
   async verify(ctx: InstallContext): Promise<boolean> {
-    const server = await which("jadx_mcp_server");
-    if (server) return true;
+    // The bridge is placed as a cloned repo we launch with `uv run`.
+    if (
+      await exists(
+        path.join(ctx.toolsDir, "jadx-mcp-server", "jadx_mcp_server.py"),
+      )
+    ) {
+      return true;
+    }
     const onPath = await which("jadx");
     if (onPath) return true;
     const managed = path.join(ctx.toolsDir, "jadx");
