@@ -26,9 +26,26 @@ const ctx = {
 };
 
 const cursor = getClient("cursor");
+const managedNode = path.join(
+  tmp,
+  "runtimes",
+  "node-22",
+  "node-v22.23.2",
+  process.platform === "win32" ? "node.exe" : path.join("bin", "node"),
+);
+const managedJshook = path.join(
+  tmp,
+  "servers",
+  "jshook",
+  "node_modules",
+  "@jshookmcp",
+  "jshook",
+  "dist",
+  "index.mjs",
+);
 
 const r1 = await cursor.applyServers(ctx, {
-  jshook: { command: "npx", args: ["-y", "@jshookmcp/jshook@latest"] },
+  jshook: { command: managedNode, args: [managedJshook] },
 });
 const cfgPath = r1.configPath;
 const after1 = JSON.parse(fs.readFileSync(cfgPath, "utf8"));

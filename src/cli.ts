@@ -8,6 +8,7 @@ import {
   currentPlatform,
   toolsDir as resolveToolsDir,
 } from "./core/platform.js";
+import { managedLayout } from "./core/layout.js";
 import { RECIPES, getRecipe, recipesForPlatform } from "./recipes/registry.js";
 import { CLIENTS, getClient } from "./clients/registry.js";
 import { runInstall, printReport } from "./engine.js";
@@ -17,11 +18,12 @@ import os from "node:os";
 function createContext(opts: {
   dryRun: boolean;
   autoInstallDeps: boolean;
+  toolsDir?: string;
 }): InstallContext {
   return {
     platform: currentPlatform(),
     arch: currentArch(),
-    toolsDir: resolveToolsDir(),
+    toolsDir: resolveToolsDir(opts.toolsDir),
     home: os.homedir(),
     logger: new ConsoleLogger(),
     dryRun: opts.dryRun,
@@ -49,11 +51,13 @@ function banner(): void {
 async function interactiveInstall(flags: {
   dryRun: boolean;
   autoDeps: boolean;
+  toolsDir?: string;
 }): Promise<void> {
   banner();
   const ctx = createContext({
     dryRun: flags.dryRun,
     autoInstallDeps: flags.autoDeps,
+    toolsDir: flags.toolsDir,
   });
 
   const available = recipesForPlatform(ctx.platform);
@@ -119,11 +123,13 @@ async function nonInteractiveInstall(flags: {
   all: boolean;
   dryRun: boolean;
   autoDeps: boolean;
+  toolsDir?: string;
 }): Promise<void> {
   banner();
   const ctx = createContext({
     dryRun: flags.dryRun,
     autoInstallDeps: flags.autoDeps,
+    toolsDir: flags.toolsDir,
   });
 
   const available = recipesForPlatform(ctx.platform);
@@ -166,9 +172,15 @@ async function nonInteractiveInstall(flags: {
   printReport(ctx, report);
 }
 
-async function doctor(): Promise<void> {
+async function doctor(toolsDir?: string): Promise<void> {
   banner();
-  const ctx = createContext({ dryRun: true, autoInstallDeps: false });
+  const ctx = createContext({
+    dryRun: true,
+    autoInstallDeps: false,
+    toolsDir,
+  });
+  ctx.logger.step("Managed shared environment");
+  ctx.logger.info(`  ${ctx.toolsDir}`);
   ctx.logger.step("MCP clients");
   for (const c of CLIENTS) {
     const p = await c.detect(ctx);
@@ -218,7 +230,11 @@ export async function main(argv: string[]): Promise<void> {
     .description(
       "One-click installer for reverse-engineering MCP servers (Ghidra, JADX, x64dbg, jshook).",
     )
-    .version("0.1.0");
+    .version("0.2.1")
+    .option(
+      "--tools-dir <path>",
+      "shared root for all managed SDKs, binaries, MCP servers and caches (or REMCP_TOOLS_DIR)",
+    );
 
   program
     .command("install", { isDefault: true })
@@ -236,14 +252,16 @@ export async function main(argv: string[]): Promise<void> {
         // commander maps --no-auto-deps to opts.autoDeps === false
         autoDeps: opts.autoDeps !== false,
       };
+      const toolsDir = program.opts<{ toolsDir?: string }>().toolsDir;
       const interactive = !opts.all && tools.length === 0 && process.stdout.isTTY;
       if (interactive) {
-        await interactiveInstall(flags);
+        await interactiveInstall({ ...flags, toolsDir });
       } else {
         await nonInteractiveInstall({
           tools,
           clients,
           all: Boolean(opts.all),
+          toolsDir,
           ...flags,
         });
       }
@@ -258,7 +276,27 @@ export async function main(argv: string[]): Promise<void> {
     .command("doctor")
     .description("Report detected clients, dependencies and recipe support")
     .action(async () => {
-      await doctor();
+      await doctor(program.opts<{ toolsDir?: string }>().toolsDir);
+    });
+
+  program
+    .command("env")
+    .description("Print the shared managed environment layout")
+    .option("--json", "print machine-readable JSON", false)
+    .action((opts) => {
+      const root = resolveToolsDir(
+        program.opts<{ toolsDir?: string }>().toolsDir,
+      );
+      const layout = managedLayout(root);
+      if (opts.json) {
+        console.log(JSON.stringify(layout, null, 2));
+        return;
+      }
+      banner();
+      console.log(color.bold("Managed shared environment:"));
+      for (const [name, value] of Object.entries(layout)) {
+        console.log(`  ${color.cyan(name.padEnd(12))} ${value}`);
+      }
     });
 
   await program.parseAsync(argv);

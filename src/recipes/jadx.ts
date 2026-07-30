@@ -6,33 +6,38 @@ import type {
   Recipe,
   RecipeInstallResult,
 } from "../core/types.js";
-import { exists, ensureDir } from "../core/fs-utils.js";
-import { which, winCmd } from "../core/exec.js";
+import { exists, ensureDir, writeText } from "../core/fs-utils.js";
+import { winCmd } from "../core/exec.js";
 import {
   downloadFile,
-  extractZip,
+  extractArchive,
   githubReleaseAsset,
 } from "../core/download.js";
+import { managedEnv, managedLayout } from "../core/layout.js";
+import {
+  assertPythonAtLeast,
+  ensureGitHubSnapshot,
+  executableHome,
+  requireDependencyPath,
+  uvManagedEnv,
+  venvPythonPath,
+  writeManagedLauncher,
+} from "../core/managed-packages.js";
 
 const JADX_REPO = "skylot/jadx";
-// Plugin ref understood by the jadx CLI plugin installer.
+const JADX_TAG = "v1.5.6";
 const PLUGIN_REF = "github:zinja-coder:jadx-ai-mcp";
-// The MCP bridge server. It is deliberately NOT installed as a wheel/uv-tool:
-// its pyproject only packages the top-level `jadx_mcp_server.py`
-// (`py-modules = ["jadx_mcp_server"]`), yet that module imports the sibling
-// `src/` package (`from src.banner import ...`). A wheel install therefore
-// crashes at startup with `ModuleNotFoundError: No module named 'src'`. We clone
-// the repo and run it in place with `uv run`, where the repo root is on
-// sys.path[0] so `src` resolves.
-const SERVER_REPO = "https://github.com/zinja-coder/jadx-mcp-server";
-// The plugin serves live decompiler context on this loopback port.
+const SERVER_REPO = "zinja-coder/jadx-mcp-server";
 const PLUGIN_PORT = 8650;
 
 function jadxLauncherName(platform: Platform): string {
   return platform === "win32" ? "jadx.bat" : "jadx";
 }
 
-/** Find `bin/<name>` under `root`, tolerating an archive that wraps its files. */
+function jadxGuiLauncherName(platform: Platform): string {
+  return platform === "win32" ? "jadx-gui.bat" : "jadx-gui";
+}
+
 async function findLauncherIn(
   root: string,
   name: string,
@@ -41,237 +46,403 @@ async function findLauncherIn(
   const direct = path.join(root, "bin", name);
   if (await exists(direct)) return direct;
   if (depth <= 0) return undefined;
-  let entries: import("node:fs").Dirent[];
-  try {
-    entries = await fsp.readdir(root, { withFileTypes: true });
-  } catch {
-    return undefined;
+  const entries = await fsp
+    .readdir(root, { withFileTypes: true })
+    .catch(() => [] as import("node:fs").Dirent[]);
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const found = await findLauncherIn(
+      path.join(root, entry.name),
+      name,
+      depth - 1,
+    );
+    if (found) return found;
   }
-  for (const e of entries) {
-    if (e.isDirectory()) {
-      const found = await findLauncherIn(path.join(root, e.name), name, depth - 1);
-      if (found) return found;
+  return undefined;
+}
+
+async function findMatchingFile(
+  root: string,
+  pattern: RegExp,
+  depth = 5,
+): Promise<string | undefined> {
+  const entries = await fsp
+    .readdir(root, { withFileTypes: true })
+    .catch(() => [] as import("node:fs").Dirent[]);
+  for (const entry of entries) {
+    const full = path.join(root, entry.name);
+    if (entry.isFile() && pattern.test(entry.name)) return full;
+    if (entry.isDirectory() && depth > 0) {
+      const nested = await findMatchingFile(full, pattern, depth - 1);
+      if (nested) return nested;
     }
   }
   return undefined;
 }
 
-/**
- * Resolve the jadx CLI launcher (`bin/jadx.bat` on Windows, `bin/jadx`
- * elsewhere). Checks PATH and our managed dir; otherwise downloads the official
- * release into `ctx.toolsDir/jadx` and extracts it.
- */
+/** Resolve only the JADX distribution owned by the shared managed root. */
 async function resolveJadxLauncher(ctx: InstallContext): Promise<string> {
+  const layout = managedLayout(ctx.toolsDir);
+  const managed = path.join(layout.tools, "jadx");
+  const completionMarker = path.join(managed, ".remcp-complete");
   const name = jadxLauncherName(ctx.platform);
-  const managed = path.join(ctx.toolsDir, "jadx");
+  const cached = await findLauncherIn(managed, name, 3);
+  if (cached && (await exists(completionMarker))) return cached;
 
-  // On PATH already? `which` returns the launcher itself.
-  const onPath =
-    (await which("jadx")) ??
-    (ctx.platform === "win32" ? await which("jadx.bat") : undefined);
-  if (onPath) return onPath;
-
-  // Previously downloaded into our managed dir?
-  const cached = await findLauncherIn(managed, name, 2);
-  if (cached) return cached;
-
-  // Download the official release. Prefer the cross-platform `jadx-<ver>.zip`:
-  // it is the only asset that ships the CLI launcher (bin/jadx[.bat]) AND the
-  // GUI launcher (bin/jadx-gui[.bat]). The Windows `jadx-gui-<ver>-win.zip` is a
-  // GUI-only bundle (jadx-gui.exe + lib/) with no bin/jadx.bat, so it cannot
-  // drive the plugin CLI — keep it only as a last-resort fallback.
   const patterns: RegExp[] =
     ctx.platform === "win32"
       ? [/jadx-\d.*\.zip$/i, /jadx-gui-.*\.zip$/i]
       : [/jadx-\d.*\.zip$/i];
-
-  ctx.logger.detail("jadx not found — downloading the official release.");
-  let asset: { url: string; name: string; tag: string } | undefined;
-  let lastErr: unknown;
-  for (const pat of patterns) {
+  let asset:
+    | {
+        url: string;
+        name: string;
+        tag: string;
+        sha256?: string;
+      }
+    | undefined;
+  let lastError: unknown;
+  for (const pattern of patterns) {
     try {
-      asset = await githubReleaseAsset(JADX_REPO, pat);
+      asset = await githubReleaseAsset(JADX_REPO, pattern, JADX_TAG);
       break;
-    } catch (err) {
-      lastErr = err;
+    } catch (error) {
+      lastError = error;
     }
   }
   if (!asset) {
-    throw new Error(`Could not resolve a jadx release asset: ${String(lastErr)}`);
-  }
-  const chosen = asset;
-
-  const zip = path.join(managed, chosen.name);
-  await ctx.logger.task(`Download jadx (${chosen.tag})`, () =>
-    downloadFile(chosen.url, zip),
-  );
-  await ctx.logger.task("Extract jadx", () => extractZip(zip, managed));
-
-  const found = await findLauncherIn(managed, name, 2);
-  if (!found) {
     throw new Error(
-      `Extracted jadx into ${managed} but could not find bin/${name}.`,
+      `Could not resolve a JADX release asset: ${String(lastError)}`,
     );
   }
+
+  const archive = path.join(layout.downloads, "jadx", asset.name);
+  await ctx.logger.task(`Download JADX (${asset.tag})`, () =>
+    downloadFile(asset.url, archive, { sha256: asset.sha256 }),
+  );
+  await fsp.rm(completionMarker, { force: true });
+  await ctx.logger.task("Extract JADX", () =>
+    extractArchive(archive, managed),
+  );
+  const found = await findLauncherIn(managed, name, 3);
+  if (!found) {
+    throw new Error(
+      `Extracted JADX into ${managed} but could not find bin/${name}.`,
+    );
+  }
+  await fsp.writeFile(completionMarker, `${asset.tag}\n`, "utf8");
   return found;
 }
 
-/**
- * Resolve an absolute path to the `uv` executable. uv's install dir is often
- * not on the client's PATH, so we emit the absolute path in the client config
- * and only fall back to the bare name (relying on PATH) if it cannot be found.
- */
-async function resolveUvCommand(): Promise<string> {
-  return (await which("uv")) ?? "uv";
+function managedJadxLauncher(ctx: InstallContext): string {
+  const layout = managedLayout(ctx.toolsDir);
+  return path.join(
+    layout.tools,
+    "jadx",
+    ctx.platform === "win32" ? "jadx-gui-managed.cmd" : "jadx-gui-managed",
+  );
 }
 
-/**
- * Clone (or fast-forward) the jadx-mcp-server repo into our managed tools dir
- * and return its root. The bridge is run from this checkout via `uv run` rather
- * than installed as a package (see SERVER_REPO note).
- */
-async function ensureJadxServerRepo(ctx: InstallContext): Promise<string> {
-  const repoDir = path.join(ctx.toolsDir, "jadx-mcp-server");
-  if (await exists(path.join(repoDir, ".git"))) {
-    // Best-effort update; ignore failures (offline / local edits present).
-    await ctx.run("git", ["-C", repoDir, "pull", "--ff-only"], {
-      allowFailure: true,
-    });
-    return repoDir;
-  }
-  await ensureDir(ctx.toolsDir);
-  await ctx.logger.task("Clone jadx-mcp-server", async () => {
-    const res = await ctx.run(
-      "git",
-      ["clone", "--depth", "1", SERVER_REPO, repoDir],
-      { allowFailure: true },
+function plannedExecutable(
+  ctx: InstallContext,
+  id: string,
+  name: string,
+): string {
+  const detected = ctx.depStatus.get(id)?.path;
+  if (detected && path.isAbsolute(detected)) return detected;
+  const layout = managedLayout(ctx.toolsDir);
+  if (id === "uv") {
+    return path.join(
+      layout.uv,
+      "<managed-uv>",
+      ctx.platform === "win32" ? "uv.exe" : "uv",
     );
-    if (!res.ok) {
-      throw new Error(
-        `git clone failed: ${res.stderr.trim() || res.stdout.trim() || "unknown error"}`,
-      );
-    }
-  });
-  return repoDir;
+  }
+  if (id === "python") {
+    return path.join(
+      layout.python,
+      "<managed-python>",
+      ctx.platform === "win32" ? "python.exe" : path.join("bin", "python"),
+    );
+  }
+  return path.join(
+    layout.tools,
+    id,
+    ctx.platform === "win32" ? `${name}.exe` : name,
+  );
+}
+
+interface JadxEnvironment extends Record<string, string> {
+  JADX_CONFIG_DIR: string;
+  JADX_CACHE_DIR: string;
+  JADX_TMP_DIR: string;
+}
+
+function jadxEnvironment(
+  ctx: InstallContext,
+  pythonPath: string,
+  javaHome?: string,
+  includeHostPath = false,
+): JadxEnvironment {
+  const layout = managedLayout(ctx.toolsDir);
+  const environmentDir = path.join(layout.envs, "jadx-mcp");
+  const base = uvManagedEnv(ctx.toolsDir, pythonPath, environmentDir);
+  const effectiveJavaHome =
+    javaHome ?? managedEnv(ctx.toolsDir).JAVA_HOME ?? "";
+  return {
+    ...base,
+    PYTHONNOUSERSITE: "1",
+    PYTHONUTF8: "1",
+    JADX_CONFIG_DIR: path.join(layout.servers, "jadx-host", "config"),
+    JADX_CACHE_DIR: path.join(layout.cache, "jadx"),
+    JADX_TMP_DIR: path.join(layout.cache, "tmp", "jadx"),
+    ...(effectiveJavaHome
+      ? {
+          JAVA_HOME: effectiveJavaHome,
+          ...(includeHostPath
+            ? {
+                PATH: [
+                  path.join(effectiveJavaHome, "bin"),
+                  process.env.PATH ?? "",
+                ]
+                  .filter(Boolean)
+                  .join(path.delimiter),
+              }
+            : {}),
+        }
+      : {}),
+  };
 }
 
 export const jadxRecipe: Recipe = {
   id: "jadx",
   name: "JADX MCP",
   description:
-    "Bridges jadx-gui's Android decompiler to MCP: installs the jadx-ai-mcp plugin into jadx-gui plus the jadx_mcp_server bridge (zinja-coder).",
+    "Managed JADX GUI, isolated plugin state and a snapshot-based Python 3.13 MCP bridge.",
   hostApp: "jadx-gui",
   platforms: ["win32", "darwin", "linux"],
-  dependencies: ["jdk21", "python", "uv", "git"],
-  approxDownloadMb: 50,
+  dependencies: ["jdk21", "uv", "python"],
+  approxDownloadMb: 80,
 
   async install(ctx: InstallContext): Promise<RecipeInstallResult> {
+    const layout = managedLayout(ctx.toolsDir);
+    const snapshotRoot = path.join(layout.servers, "jadx-mcp-server");
+    const repoDir = path.join(snapshotRoot, "current");
+    const serverScript = path.join(repoDir, "jadx_mcp_server.py");
+    const environmentDir = path.join(layout.envs, "jadx-mcp");
+    const environmentPython = venvPythonPath(environmentDir, ctx.platform);
+    const pythonPath = plannedExecutable(ctx, "python", "python");
+    const plannedLauncher = managedJadxLauncher(ctx);
+    const plannedEnv = jadxEnvironment(ctx, pythonPath);
+
     if (ctx.dryRun) {
       ctx.logger.detail(
-        "(dry-run) would ensure jadx-gui + the jadx-ai-mcp plugin, clone jadx-mcp-server, `uv sync` it, and register `uv --directory <repo> run jadx_mcp_server.py`.",
+        `(dry-run) would install JADX under ${path.join(layout.tools, "jadx")}, isolate its config/cache/temp directories, download ${SERVER_REPO}@main into ${repoDir}, and sync ${environmentDir}.`,
       );
       return {
         servers: {
           jadx: {
             type: "stdio",
-            command: "uv",
-            args: [
-              "--directory",
-              path.join(ctx.toolsDir, "jadx-mcp-server"),
-              "run",
-              "jadx_mcp_server.py",
-            ],
+            command: environmentPython,
+            args: [serverScript],
+            env: plannedEnv,
           },
         },
-        placedFiles: [],
+        placedFiles: [
+          serverScript,
+          environmentPython,
+          plannedLauncher,
+          plannedEnv.JADX_CONFIG_DIR,
+        ],
       };
     }
 
-    const notes: string[] = [];
-    const launcher = await resolveJadxLauncher(ctx);
+    const javaPath = requireDependencyPath(ctx, "jdk21");
+    const managedPython = requireDependencyPath(ctx, "python");
+    const managedUv = requireDependencyPath(ctx, "uv");
+    await assertPythonAtLeast(ctx, managedPython, 3, 13);
+    const javaHome = executableHome(javaPath);
+    const serverEnv = jadxEnvironment(ctx, managedPython, javaHome);
+    const hostEnv = jadxEnvironment(ctx, managedPython, javaHome, true);
+    await Promise.all([
+      ensureDir(serverEnv.JADX_CONFIG_DIR),
+      ensureDir(serverEnv.JADX_CACHE_DIR),
+      ensureDir(serverEnv.JADX_TMP_DIR),
+      ensureDir(environmentDir),
+    ]);
 
-    // 1) Install the jadx-ai-mcp plugin via the jadx CLI (writes into the user's
-    //    jadx config). The .bat launcher must go through cmd /c on Windows.
-    await ctx.logger.task("Install jadx-ai-mcp plugin", async () => {
-      const args = ["plugins", "--install", PLUGIN_REF];
-      const res =
-        ctx.platform === "win32"
-          ? await winCmd(launcher, args, { allowFailure: true })
-          : await ctx.run(launcher, args, { allowFailure: true });
-      if (!res.ok) {
-        const why = res.stderr.trim() || res.stdout.trim() || "network/plugin repo error";
-        ctx.logger.warn(
-          `Could not install jadx-ai-mcp automatically (${why}). In jadx-gui: Plugins -> Install plugin -> ${PLUGIN_REF}.`,
-        );
-        notes.push(
-          `jadx-ai-mcp plugin auto-install failed — install it from jadx-gui (Plugins -> Install plugin -> ${PLUGIN_REF}).`,
-        );
-      }
-    });
+    const cliLauncher = await resolveJadxLauncher(ctx);
+    const guiLauncher = await findLauncherIn(
+      path.join(layout.tools, "jadx"),
+      jadxGuiLauncherName(ctx.platform),
+      3,
+    );
+    if (!guiLauncher) {
+      throw new Error("Managed JADX archive does not contain jadx-gui.");
+    }
 
-    // 2) Clone the MCP bridge server and pre-sync its venv, so the client's
-    //    first spawn is fast. A cold `uv run` downloads the whole dependency
-    //    set (fastmcp, uvicorn, pywin32, ...) on first launch and can blow the
-    //    client's connect timeout, showing the server as "failed".
-    const repoDir = await ensureJadxServerRepo(ctx);
-    await ctx.logger.task("Prepare jadx_mcp_server env (uv sync)", async () => {
-      const res = await ctx.run("uv", ["--directory", repoDir, "sync"], {
-        allowFailure: true,
-        timeoutMs: 300_000,
+    let pluginFile = await findMatchingFile(
+      hostEnv.JADX_CONFIG_DIR,
+      /jadx-ai-mcp.*\.jar$/i,
+    );
+    if (!pluginFile) {
+      await ctx.logger.task("Install jadx-ai-mcp plugin", async () => {
+        const args = ["plugins", "--install", PLUGIN_REF];
+        const result =
+          ctx.platform === "win32"
+            ? await winCmd(cliLauncher, args, {
+                allowFailure: true,
+                env: hostEnv,
+                timeoutMs: 300_000,
+              })
+            : await ctx.run(cliLauncher, args, {
+                allowFailure: true,
+                env: hostEnv,
+                timeoutMs: 300_000,
+              });
+        if (!result.ok) {
+          throw new Error(
+            `jadx-ai-mcp plugin install failed: ${result.stderr.trim() || result.stdout.trim() || "unknown error"}`,
+          );
+        }
       });
-      if (!res.ok) {
-        const why = res.stderr.trim() || res.stdout.trim() || "unknown error";
-        ctx.logger.warn(
-          `uv sync failed (${why}). The server will sync on first launch, which may delay the client's first connection.`,
-        );
-        notes.push(
-          `jadx_mcp_server env not pre-synced — retry once with: uv --directory ${repoDir} sync`,
-        );
-      }
-    });
-
-    // Emit `uv --directory <repo> run jadx_mcp_server.py`: running the entry
-    // script in place puts the repo root on sys.path so the `src` package
-    // resolves, and uv provisions/updates the venv transparently.
-    const uvCmd = await resolveUvCommand();
-    if (uvCmd === "uv") {
-      notes.push(
-        "Could not resolve an absolute path to uv — config uses the bare name, so ensure uv is on PATH for your client.",
+      pluginFile = await findMatchingFile(
+        hostEnv.JADX_CONFIG_DIR,
+        /jadx-ai-mcp.*\.jar$/i,
       );
     }
+    if (!pluginFile) {
+      throw new Error(
+        `jadx-ai-mcp reported success but no plugin JAR was found under ${hostEnv.JADX_CONFIG_DIR}`,
+      );
+    }
+
+    const snapshot = await ctx.logger.task(
+      "Download jadx-mcp-server main snapshot",
+      () =>
+        ensureGitHubSnapshot(ctx, {
+          repo: SERVER_REPO,
+          branch: "main",
+          destination: snapshotRoot,
+          marker: "jadx_mcp_server.py",
+        }),
+    );
+    const environmentMarker = path.join(
+      environmentDir,
+      ".remcp-complete",
+    );
+    const completedCommit = await fsp
+      .readFile(environmentMarker, "utf8")
+      .then((value) => value.trim())
+      .catch(() => "");
+    if (
+      !(await exists(environmentPython)) ||
+      completedCommit !== snapshot.commit
+    ) {
+      const synced = await ctx.logger.task(
+        "Prepare jadx_mcp_server Python 3.13 environment",
+        () =>
+          ctx.run(
+            managedUv,
+            [
+              "--directory",
+              snapshot.repoDir,
+              "sync",
+              "--python",
+              managedPython,
+            ],
+            {
+              allowFailure: true,
+              env: serverEnv,
+              timeoutMs: 600_000,
+            },
+          ),
+      );
+      if (!synced.ok || !(await exists(environmentPython))) {
+        throw new Error(
+          `uv sync failed for jadx-mcp-server: ${synced.stderr.trim() || synced.stdout.trim() || "managed environment was not created"}`,
+        );
+      }
+      await writeText(environmentMarker, `${snapshot.commit}\n`);
+    }
+
+    const generatedLauncher = await writeManagedLauncher(ctx, {
+      launcherPath: plannedLauncher,
+      executable: guiLauncher,
+      env: hostEnv,
+    });
 
     return {
       servers: {
         jadx: {
           type: "stdio",
-          command: uvCmd,
-          args: ["--directory", repoDir, "run", "jadx_mcp_server.py"],
+          command: environmentPython,
+          args: [path.join(snapshot.repoDir, "jadx_mcp_server.py")],
+          env: serverEnv,
         },
       },
-      placedFiles: [],
-      notes,
+      placedFiles: [
+        path.join(snapshot.repoDir, "jadx_mcp_server.py"),
+        environmentPython,
+        generatedLauncher,
+        pluginFile,
+      ],
+      notes: [
+        `jadx-mcp-server snapshot: ${snapshot.commit}`,
+        `Launch JADX through ${generatedLauncher} so the managed plugin config and JDK are used.`,
+      ],
     };
   },
 
   postInstallNotes: [
-    "Open jadx-gui and load your APK/DEX/JAR before using the tools. The plugin serves live decompiler context on 127.0.0.1:8650, and the MCP tools return nothing while jadx-gui is closed or has no target loaded.",
-    "You need BOTH halves for this to work: the jadx-ai-mcp plugin inside jadx-gui AND the jadx_mcp_server bridge registered in your client.",
-    "jadx requires a JRE/JDK 11+ on PATH (JDK 21 installed by this tool satisfies it).",
-    "The bridge runs from a cloned checkout via `uv run`, which provisions its own venv. If the client's first connection times out, pre-build the env once: `uv --directory <toolsDir>/jadx-mcp-server sync`.",
+    "Launch JADX through the generated jadx-gui-managed launcher, then load an APK/DEX/JAR.",
+    `The managed jadx-ai-mcp plugin serves decompiler context on 127.0.0.1:${PLUGIN_PORT}.`,
+    "The bridge is synced from a GitHub main-branch commit snapshot into an isolated Python 3.13 environment.",
   ],
 
   async verify(ctx: InstallContext): Promise<boolean> {
-    // The bridge is placed as a cloned repo we launch with `uv run`.
-    if (
-      await exists(
-        path.join(ctx.toolsDir, "jadx-mcp-server", "jadx_mcp_server.py"),
-      )
-    ) {
-      return true;
-    }
-    const onPath = await which("jadx");
-    if (onPath) return true;
-    const managed = path.join(ctx.toolsDir, "jadx");
-    return (await findLauncherIn(managed, jadxLauncherName(ctx.platform), 2)) !== undefined;
+    const layout = managedLayout(ctx.toolsDir);
+    const cli = await findLauncherIn(
+      path.join(layout.tools, "jadx"),
+      jadxLauncherName(ctx.platform),
+      3,
+    );
+    const plugin = await findMatchingFile(
+      path.join(layout.servers, "jadx-host", "config"),
+      /jadx-ai-mcp.*\.jar$/i,
+    );
+    return Boolean(
+      cli &&
+        plugin &&
+        (await exists(
+          path.join(layout.tools, "jadx", ".remcp-complete"),
+        )) &&
+        (await exists(
+          path.join(
+            layout.servers,
+            "jadx-mcp-server",
+            "current",
+            "jadx_mcp_server.py",
+          ),
+        )) &&
+        (await exists(
+          path.join(
+            layout.servers,
+            "jadx-mcp-server",
+            "current",
+            ".remcp-complete",
+          ),
+        )) &&
+        (await exists(
+          venvPythonPath(
+            path.join(layout.envs, "jadx-mcp"),
+            ctx.platform,
+          ),
+        )) &&
+        (await exists(
+          path.join(layout.envs, "jadx-mcp", ".remcp-complete"),
+        )) &&
+        (await exists(managedJadxLauncher(ctx))),
+    );
   },
 };

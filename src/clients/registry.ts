@@ -10,6 +10,7 @@ import {
 } from "../core/types.js";
 import { exists, readJsonSafe, writeJsonWithBackup } from "../core/fs-utils.js";
 import { which } from "../core/exec.js";
+import { managedEnv, managedLayout } from "../core/layout.js";
 
 interface ClientCaps {
   /** Client can talk to a remote http/sse URL directly. If false we bridge via mcp-remote. */
@@ -33,10 +34,23 @@ interface ClientDef {
   restartHint: string;
 }
 
-const home = os.homedir();
-const APPDATA = process.env.APPDATA ?? path.join(home, "AppData", "Roaming");
-const LOCALAPPDATA =
-  process.env.LOCALAPPDATA ?? path.join(home, "AppData", "Local");
+function clientHome(ctx: InstallContext): string {
+  return ctx.home || os.homedir();
+}
+
+function roamingAppData(ctx: InstallContext): string {
+  const home = clientHome(ctx);
+  return home === os.homedir() && process.env.APPDATA
+    ? process.env.APPDATA
+    : path.join(home, "AppData", "Roaming");
+}
+
+function localAppData(ctx: InstallContext): string {
+  const home = clientHome(ctx);
+  return home === os.homedir() && process.env.LOCALAPPDATA
+    ? process.env.LOCALAPPDATA
+    : path.join(home, "AppData", "Local");
+}
 
 function isNpx(command: string): boolean {
   const base = path.basename(command).toLowerCase();
@@ -47,12 +61,12 @@ function isNpx(command: string): boolean {
 function transformServer(
   server: McpServerConfig,
   caps: ClientCaps,
-  platform: string,
+  ctx: InstallContext,
 ): McpServerConfig {
   if (isStdioServer(server)) {
     let command = server.command;
     let args = server.args ? [...server.args] : [];
-    if (platform === "win32" && caps.wrapNpxWithCmd && isNpx(command)) {
+    if (ctx.platform === "win32" && caps.wrapNpxWithCmd && isNpx(command)) {
       args = ["/c", command, ...args];
       command = "cmd";
     }
@@ -64,11 +78,37 @@ function transformServer(
 
   // Remote server (http/sse).
   if (!caps.supportsRemote) {
-    // Bridge to a stdio client via mcp-remote.
+    // Bridge to a stdio-only client using the pinned package installed in the
+    // shared root. No client launch needs PATH, npx, or a network connection.
+    const layout = managedLayout(ctx.toolsDir);
+    const node =
+      ctx.depStatus.get("node2212")?.path ??
+      path.join(
+        layout.node22,
+        "<managed-node>",
+        ctx.platform === "win32" ? "node.exe" : path.join("bin", "node"),
+      );
+    if (!ctx.dryRun && !ctx.depStatus.get("node2212")?.installed) {
+      throw new Error(
+        `Managed Node.js is required to bridge ${server.url} for this client.`,
+      );
+    }
+    const proxy = path.join(
+      layout.servers,
+      "mcp-remote",
+      "node_modules",
+      "mcp-remote",
+      "dist",
+      "proxy.js",
+    );
     return transformServer(
-      { command: "npx", args: ["-y", "mcp-remote", server.url] },
+      {
+        command: node,
+        args: [proxy, server.url],
+        env: managedEnv(ctx.toolsDir),
+      },
       caps,
-      platform,
+      ctx,
     );
   }
   const out: Record<string, unknown> = { type: server.type };
@@ -137,7 +177,7 @@ class GenericClient implements ClientTarget {
 
     const written: string[] = [];
     for (const [name, server] of Object.entries(servers)) {
-      bucket[name] = transformServer(server, this.def.caps, ctx.platform);
+      bucket[name] = transformServer(server, this.def.caps, ctx);
       written.push(name);
     }
     const next = { ...existing, [key]: bucket };
@@ -168,9 +208,12 @@ const DEFS: ClientDef[] = [
   {
     id: "claude-desktop",
     name: "Claude Desktop",
-    candidatePaths: () => {
+    candidatePaths: (ctx) => {
+      const home = clientHome(ctx);
+      const appData = roamingAppData(ctx);
+      const local = localAppData(ctx);
       const msix = path.join(
-        LOCALAPPDATA,
+        local,
         "Packages",
         "Claude_pzs8sxrjxfjjc",
         "LocalCache",
@@ -178,7 +221,7 @@ const DEFS: ClientDef[] = [
         "Claude",
         "claude_desktop_config.json",
       );
-      const standard = path.join(APPDATA, "Claude", "claude_desktop_config.json");
+      const standard = path.join(appData, "Claude", "claude_desktop_config.json");
       const macish = path.join(
         home,
         "Library",
@@ -186,8 +229,8 @@ const DEFS: ClientDef[] = [
         "Claude",
         "claude_desktop_config.json",
       );
-      if (process.platform === "win32") return [msix, standard];
-      if (process.platform === "darwin") return [macish];
+      if (ctx.platform === "win32") return [msix, standard];
+      if (ctx.platform === "darwin") return [macish];
       return [path.join(home, ".config", "Claude", "claude_desktop_config.json")];
     },
     caps: {
@@ -202,18 +245,22 @@ const DEFS: ClientDef[] = [
   {
     id: "cursor",
     name: "Cursor",
-    candidatePaths: () => [path.join(home, ".cursor", "mcp.json")],
+    candidatePaths: (ctx) => [
+      path.join(clientHome(ctx), ".cursor", "mcp.json"),
+    ],
     caps: COMMON_CAPS,
     restartHint: "Quit and reopen Cursor (or toggle the server in Settings → Tools & MCP).",
   },
   {
     id: "cline",
     name: "Cline (VS Code)",
-    candidatePaths: () => {
+    candidatePaths: (ctx) => {
+      const home = clientHome(ctx);
+      const appData = roamingAppData(ctx);
       const base =
-        process.platform === "win32"
-          ? path.join(APPDATA, "Code", "User")
-          : process.platform === "darwin"
+        ctx.platform === "win32"
+          ? path.join(appData, "Code", "User")
+          : ctx.platform === "darwin"
             ? path.join(home, "Library", "Application Support", "Code", "User")
             : path.join(home, ".config", "Code", "User");
       return [
@@ -233,8 +280,13 @@ const DEFS: ClientDef[] = [
   {
     id: "windsurf",
     name: "Windsurf",
-    candidatePaths: () => [
-      path.join(home, ".codeium", "windsurf", "mcp_config.json"),
+    candidatePaths: (ctx) => [
+      path.join(
+        clientHome(ctx),
+        ".codeium",
+        "windsurf",
+        "mcp_config.json",
+      ),
     ],
     caps: {
       supportsRemote: true,
@@ -247,7 +299,7 @@ const DEFS: ClientDef[] = [
   {
     id: "claude-code",
     name: "Claude Code (CLI)",
-    candidatePaths: () => [path.join(home, ".claude.json")],
+    candidatePaths: (ctx) => [path.join(clientHome(ctx), ".claude.json")],
     extraDetect: async () => (await which("claude")) !== undefined,
     caps: {
       supportsRemote: true,

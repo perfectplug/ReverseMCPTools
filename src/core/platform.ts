@@ -21,14 +21,27 @@ export function isWindows(): boolean {
   return process.platform === "win32";
 }
 
-/** Managed directory where we download tools, plugins and bridges. */
-export function toolsDir(): string {
+/**
+ * Managed directory where runtimes, tools, plugins and download caches live.
+ * With no override, use one fixed directory under the OS temporary directory.
+ *
+ * Callers may pass an explicit root (for example from a CLI flag). Environment
+ * variables make the same store discoverable by other AI clients/processes
+ * without requiring a global PATH mutation.
+ */
+export function toolsDir(explicit?: string): string {
+  const configured =
+    explicit?.trim() ||
+    process.env.REMCP_TOOLS_DIR?.trim() ||
+    process.env.REVERSE_MCP_TOOLS_DIR?.trim();
+  if (configured) return path.resolve(configured);
+
   if (isWindows()) {
-    const base =
-      process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local");
-    return path.join(base, "ReverseMCPTools");
+    return path.resolve(os.tmpdir(), "ReverseMCPTools");
   }
-  const xdg = process.env.XDG_DATA_HOME;
-  if (xdg) return path.join(xdg, "reverse-mcp-tools");
-  return path.join(os.homedir(), ".reverse-mcp-tools");
+  const userId =
+    typeof process.getuid === "function"
+      ? String(process.getuid())
+      : os.userInfo().username.replace(/[^a-z0-9_.-]/gi, "_");
+  return path.resolve(os.tmpdir(), `reverse-mcp-tools-${userId}`);
 }

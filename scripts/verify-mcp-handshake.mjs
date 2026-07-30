@@ -6,8 +6,8 @@ import { spawn } from "node:child_process";
 const isWin = process.platform === "win32";
 const cmd = isWin ? "cmd" : "npx";
 const args = isWin
-  ? ["/c", "npx", "-y", "@jshookmcp/jshook@latest"]
-  : ["-y", "@jshookmcp/jshook@latest"];
+  ? ["/c", "npx", "-y", "@jshookmcp/jshook@0.3.4"]
+  : ["-y", "@jshookmcp/jshook@0.3.4"];
 
 const child = spawn(cmd, args, {
   env: {

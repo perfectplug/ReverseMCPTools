@@ -6,6 +6,7 @@ import {
 } from "./core/types.js";
 import { color } from "./core/logger.js";
 import { ensureDependencies } from "./deps/manager.js";
+import { ensureManagedLayout } from "./core/layout.js";
 
 export interface RecipeOutcome {
   recipe: Recipe;
@@ -42,6 +43,9 @@ export async function runInstall(
   recipes: Recipe[],
   clients: ClientTarget[],
 ): Promise<InstallReport> {
+  if (!ctx.dryRun) {
+    await ensureManagedLayout(ctx.toolsDir);
+  }
   const recipeOutcomes: RecipeOutcome[] = [];
   const merged: Record<string, McpServerConfig> = {};
 
@@ -68,13 +72,29 @@ export async function runInstall(
     const unmet = deps.filter((d) => !d.satisfied).map((d) => d.name);
     if (unmet.length > 0) {
       ctx.logger.warn(
-        `${recipe.name}: unmet dependencies (${unmet.join(", ")}). Continuing to place files, but the server may not run until they are installed.`,
+        `${recipe.name}: unmet dependencies (${unmet.join(", ")}).`,
       );
+      if (!ctx.dryRun) {
+        recipeOutcomes.push({
+          recipe,
+          ok: false,
+          servers: {},
+          placedFiles: [],
+          unmetDeps: unmet,
+          error: "required managed dependencies are unavailable",
+        });
+        continue;
+      }
     }
 
     // 2. Placement.
     try {
       const result = await recipe.install(ctx);
+      if (!ctx.dryRun && recipe.verify && !(await recipe.verify(ctx))) {
+        throw new Error(
+          `post-install verification failed under ${ctx.toolsDir}`,
+        );
+      }
       Object.assign(merged, result.servers);
       for (const note of result.notes ?? []) ctx.logger.detail(note);
       recipeOutcomes.push({
@@ -88,7 +108,9 @@ export async function runInstall(
       if (files.length) {
         ctx.logger.detail(`Placed: ${files.length} file(s).`);
       }
-      ctx.logger.success(`${recipe.name} ready.`);
+      ctx.logger.success(
+        ctx.dryRun ? `${recipe.name} planned.` : `${recipe.name} ready.`,
+      );
     } catch (err) {
       const msg = (err as Error).message;
       ctx.logger.error(`${recipe.name} failed: ${msg}`);
@@ -122,7 +144,9 @@ export async function runInstall(
         written: res.written,
       });
       ctx.logger.success(
-        `${client.name}: wrote ${res.written.join(", ")} → ${res.configPath}`,
+        ctx.dryRun
+          ? `${client.name}: planned ${res.written.join(", ")} → ${res.configPath}`
+          : `${client.name}: wrote ${res.written.join(", ")} → ${res.configPath}`,
       );
       if (res.backupPath) {
         ctx.logger.detail(`Backed up previous config to ${res.backupPath}`);

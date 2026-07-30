@@ -5,7 +5,7 @@ import type { ExecOptions, ExecResult } from "./types.js";
  * Run a command and capture its output. Uses `shell: false` and an argv array
  * so user-controlled paths never go through shell interpolation.
  *
- * On Windows, `.cmd`/`.bat` shims (npx, winget wrappers, etc.) cannot be spawned
+ * On Windows, `.cmd`/`.bat` shims (npm/npx launchers, etc.) cannot be spawned
  * directly by Node, so callers should invoke those via `cmd /c <shim> ...` or use
  * the `winCmd` helper below.
  */
@@ -60,7 +60,8 @@ export async function exec(
 }
 
 /**
- * Run a Windows `.cmd`/`.bat` shim (e.g. `npx`, `winget` when needed) via cmd.exe.
+ * Run a Windows `.cmd`/`.bat` shim (for example a managed host launcher) via
+ * cmd.exe.
  * On non-Windows this just runs the command directly.
  */
 export function winCmd(

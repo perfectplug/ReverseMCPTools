@@ -79,9 +79,9 @@ export interface ClientTarget {
   detect(ctx: InstallContext): Promise<ClientPresence>;
   /**
    * Apply the given servers into this client's config, merging with any
-   * existing entries. Implementations own client-specific transforms (e.g.
-   * Claude Code wrapping `npx` in `cmd /c` on Windows). Returns the path
-   * written and whether a backup was made.
+   * existing entries. Implementations own client-specific transforms (for
+   * example bridging a remote server through the managed mcp-remote copy).
+   * Returns the path written and whether a backup was made.
    */
   applyServers(
     ctx: InstallContext,
@@ -168,7 +168,7 @@ export interface Logger {
 export interface InstallContext {
   platform: Platform;
   arch: Arch;
-  /** Managed directory where downloaded tools/bridges live. */
+  /** Managed directory where downloaded tools/bridges live (OS temp by default). */
   toolsDir: string;
   home: string;
   logger: Logger;

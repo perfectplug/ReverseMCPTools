@@ -6,27 +6,27 @@ import type {
   RecipeInstallResult,
 } from "../core/types.js";
 import { exists, ensureDir, copyFile } from "../core/fs-utils.js";
-import { which } from "../core/exec.js";
 import {
   downloadFile,
-  extractZip,
+  extractArchive,
   githubReleaseAsset,
 } from "../core/download.js";
+import { managedLayout } from "../core/layout.js";
+import {
+  ensureManagedNpmPackage,
+  requireDependencyPath,
+} from "../core/managed-packages.js";
 
 const PLUGIN_REPO = "SetsunaYukiOvO/x64dbg-mcp";
 const X64DBG_REPO = "x64dbg/x64dbg";
+const PLUGIN_TAG = "v1.0.10";
+const X64DBG_TAG = "2026.05.27";
+const MCP_REMOTE_VERSION = "0.1.38";
 const PORT = 3000;
 
-/**
- * The plugin's own generated defaults, but with `auto_start_mcp_on_plugin_load`
- * turned ON. Without it the HTTP server does NOT start on launch: the user has
- * to click Plugins -> MCP Server -> Start MCP HTTP Server every time, and the
- * client shows the server as "failed" until they do. Dangerous operations
- * (memory/register writes, script execution) stay OFF by default.
- */
 function defaultPluginConfig(): Record<string, unknown> {
   return {
-    version: "1.0.9",
+    version: "1.0.10",
     server: { address: "127.0.0.1", port: PORT },
     permissions: {
       allow_memory_write: false,
@@ -34,10 +34,25 @@ function defaultPluginConfig(): Record<string, unknown> {
       allow_script_execution: false,
       allow_breakpoint_modification: true,
       allowed_methods: [
-        "debug.*", "register.*", "memory.*", "breakpoint.*", "disasm.*",
-        "disassembly.*", "module.*", "symbol.*", "thread.*", "stack.*",
-        "comment.*", "context.*", "dump.*", "eval.*", "xref.*", "function.*",
-        "assembler.*", "bookmark.*", "patch.*",
+        "debug.*",
+        "register.*",
+        "memory.*",
+        "breakpoint.*",
+        "disasm.*",
+        "disassembly.*",
+        "module.*",
+        "symbol.*",
+        "thread.*",
+        "stack.*",
+        "comment.*",
+        "context.*",
+        "dump.*",
+        "eval.*",
+        "xref.*",
+        "function.*",
+        "assembler.*",
+        "bookmark.*",
+        "patch.*",
       ],
     },
     security: { origin_allowlist: [], host_allowlist: [] },
@@ -63,31 +78,21 @@ function defaultPluginConfig(): Record<string, unknown> {
   };
 }
 
-/**
- * The plugin reads its config from `<plugins>/<name>/config.json`, where <name>
- * is the plugin basename with underscores turned to hyphens (the .dp64
- * `x64dbg_mcp` -> `x64dbg-mcp`; the .dp32 `x32dbg_mcp` -> `x32dbg-mcp`).
- */
 function pluginConfigDir(pluginsDir: string, assetName: string): string {
   const base = assetName.replace(/\.dp\d+$/i, "").replace(/_/g, "-");
   return path.join(pluginsDir, base);
 }
 
-/**
- * Ensure the plugin's HTTP server auto-starts. If a config already exists (the
- * plugin generated one on a prior run, or the user hand-edited it), flip only
- * the single flag so their other settings survive; otherwise seed the full
- * default. Returns the config path written, or undefined on failure.
- */
-async function enableAutoStart(configDir: string): Promise<string | undefined> {
+async function enableAutoStart(
+  configDir: string,
+): Promise<string | undefined> {
   const configPath = path.join(configDir, "config.json");
   try {
     await ensureDir(configDir);
     if (await exists(configPath)) {
-      const cfg = JSON.parse(await fsp.readFile(configPath, "utf8")) as Record<
-        string,
-        unknown
-      >;
+      const cfg = JSON.parse(
+        await fsp.readFile(configPath, "utf8"),
+      ) as Record<string, unknown>;
       const features =
         cfg.features && typeof cfg.features === "object"
           ? (cfg.features as Record<string, unknown>)
@@ -107,43 +112,54 @@ async function enableAutoStart(configDir: string): Promise<string | undefined> {
   }
 }
 
-/**
- * Locate an x64dbg install `release` root (the folder containing `x32/` and
- * `x64/`). Checks PATH and common locations; otherwise downloads the official
- * snapshot into our managed tools dir.
- */
+/** Resolve only the x64dbg copy owned by the shared managed root. */
 async function resolveX64dbgRoot(ctx: InstallContext): Promise<string> {
-  const managed = path.join(ctx.toolsDir, "x64dbg", "release");
-  const candidates: string[] = [];
-
-  const onPath = await which("x64dbg");
-  if (onPath) {
-    // .../release/x64/x64dbg.exe -> .../release
-    candidates.push(path.resolve(path.dirname(onPath), "..", ".."));
-  }
-  candidates.push(managed);
-
-  for (const c of candidates) {
-    if ((await exists(path.join(c, "x64"))) || (await exists(path.join(c, "x32")))) {
-      return c;
-    }
+  const layout = managedLayout(ctx.toolsDir);
+  const managedBase = path.join(layout.tools, "x64dbg");
+  const managed = path.join(managedBase, "release");
+  const completionMarker = path.join(managedBase, ".remcp-complete");
+  const hasHostBinary = async (): Promise<boolean> =>
+    (await exists(path.join(managed, "x64", "x64dbg.exe"))) ||
+    (await exists(path.join(managed, "x32", "x32dbg.exe")));
+  if (
+    (await hasHostBinary()) &&
+    (await exists(completionMarker))
+  ) {
+    return managed;
   }
 
-  // Not found: download the official snapshot (full-auto).
-  ctx.logger.detail("x64dbg not found — downloading the official snapshot.");
+  ctx.logger.detail(
+    "Managed x64dbg is missing; downloading the official snapshot.",
+  );
   const asset = await ctx.logger.task("Resolve x64dbg snapshot", () =>
-    githubReleaseAsset(X64DBG_REPO, /snapshot_.*\.zip$/i),
+    githubReleaseAsset(X64DBG_REPO, /snapshot_.*\.zip$/i, X64DBG_TAG),
   );
-  const zip = path.join(ctx.toolsDir, "x64dbg", asset.name);
+  const archive = path.join(layout.downloads, "x64dbg", asset.name);
   await ctx.logger.task(`Download x64dbg (${asset.tag})`, () =>
-    downloadFile(asset.url, zip),
+    downloadFile(asset.url, archive, { sha256: asset.sha256 }),
   );
+  await fsp.rm(completionMarker, { force: true });
   await ctx.logger.task("Extract x64dbg", () =>
-    extractZip(zip, path.join(ctx.toolsDir, "x64dbg")),
+    extractArchive(archive, managedBase),
   );
-  if (await exists(managed)) return managed;
+  if (await hasHostBinary()) {
+    await fsp.writeFile(completionMarker, `${asset.tag}\n`, "utf8");
+    return managed;
+  }
   throw new Error(
-    `Extracted x64dbg but could not find a 'release' folder under ${path.join(ctx.toolsDir, "x64dbg")}`,
+    `Extracted x64dbg but could not find a release folder under ${managedBase}`,
+  );
+}
+
+function mcpRemoteEntry(ctx: InstallContext): string {
+  const layout = managedLayout(ctx.toolsDir);
+  return path.join(
+    layout.servers,
+    "mcp-remote",
+    "node_modules",
+    "mcp-remote",
+    "dist",
+    "proxy.js",
   );
 }
 
@@ -151,69 +167,139 @@ export const x64dbgRecipe: Recipe = {
   id: "x64dbg",
   name: "x64dbg MCP",
   description:
-    "Native C++ plugin that serves MCP over HTTP from inside x64dbg (SetsunaYukiOvO/x64dbg-mcp).",
+    "Managed x64dbg snapshot with native MCP plugins and a managed stdio bridge.",
   hostApp: "x64dbg / x32dbg",
   platforms: ["win32"],
-  dependencies: [], // zero runtime deps — the plugin is self-contained
-  approxDownloadMb: 60,
+  dependencies: ["node2212"],
+  approxDownloadMb: 65,
 
   async install(ctx: InstallContext): Promise<RecipeInstallResult> {
+    const layout = managedLayout(ctx.toolsDir);
+    const plannedRoot = path.join(layout.tools, "x64dbg", "release");
+    const remoteInstallDir = path.join(layout.servers, "mcp-remote");
+    const remoteEntry = mcpRemoteEntry(ctx);
     if (ctx.dryRun) {
       ctx.logger.detail(
-        "(dry-run) would ensure x64dbg is present, drop the MCP plugin (.dp64/.dp32) into <x64dbg>/release/{x64,x32}/plugins, and enable auto_start_mcp_on_plugin_load in each plugin's config.json.",
+        `(dry-run) would install x64dbg under ${plannedRoot}, place both native plugins there, and install mcp-remote@${MCP_REMOTE_VERSION} under ${remoteInstallDir}.`,
       );
       return {
-        servers: { x64dbg: { type: "http", url: `http://127.0.0.1:${PORT}/mcp` } },
-        placedFiles: [],
+        servers: {
+          x64dbg: {
+            type: "http",
+            url: `http://127.0.0.1:${PORT}/mcp`,
+          },
+        },
+        placedFiles: [
+          path.join(
+            plannedRoot,
+            "x64",
+            "plugins",
+            "x64dbg_mcp.dp64",
+          ),
+          path.join(
+            plannedRoot,
+            "x32",
+            "plugins",
+            "x32dbg_mcp.dp32",
+          ),
+          remoteEntry,
+        ],
       };
     }
 
+    const nodePath = requireDependencyPath(ctx, "node2212");
     const root = await resolveX64dbgRoot(ctx);
     const placed: string[] = [];
     const notes: string[] = [];
-
-    const targets: { assetRe: RegExp; subdir: string; label: string }[] = [
-      { assetRe: /x64dbg_mcp\.dp64$/i, subdir: "x64", label: "x64 (64-bit)" },
-      { assetRe: /x32dbg_mcp\.dp32$/i, subdir: "x32", label: "x32 (32-bit)" },
+    const targets: {
+      assetName: string;
+      assetRe: RegExp;
+      subdir: string;
+      label: string;
+    }[] = [
+      {
+        assetName: "x64dbg_mcp.dp64",
+        assetRe: /x64dbg_mcp\.dp64$/i,
+        subdir: "x64",
+        label: "x64 (64-bit)",
+      },
+      {
+        assetName: "x32dbg_mcp.dp32",
+        assetRe: /x32dbg_mcp\.dp32$/i,
+        subdir: "x32",
+        label: "x32 (32-bit)",
+      },
     ];
 
-    for (const t of targets) {
-      const pluginsDir = path.join(root, t.subdir, "plugins");
-      if (!(await exists(path.join(root, t.subdir)))) {
-        ctx.logger.detail(`Skipping ${t.label}: ${t.subdir}/ not present in this x64dbg build.`);
+    for (const target of targets) {
+      if (!(await exists(path.join(root, target.subdir)))) {
+        ctx.logger.detail(
+          `Skipping ${target.label}: ${target.subdir}/ is absent from this snapshot.`,
+        );
         continue;
       }
-      const asset = await githubReleaseAsset(PLUGIN_REPO, t.assetRe);
-      const download = path.join(ctx.toolsDir, "x64dbg-mcp", asset.name);
-      await ctx.logger.task(`Download ${t.label} plugin (${asset.tag})`, () =>
-        downloadFile(asset.url, download),
-      );
+      const pluginsDir = path.join(root, target.subdir, "plugins");
       await ensureDir(pluginsDir);
-      const dest = path.join(pluginsDir, asset.name);
-      await copyFile(download, dest);
-      placed.push(dest);
+      const destination = path.join(pluginsDir, target.assetName);
+      if (!(await exists(destination))) {
+        const asset = await githubReleaseAsset(
+          PLUGIN_REPO,
+          target.assetRe,
+          PLUGIN_TAG,
+        );
+        const download = path.join(
+          layout.downloads,
+          "x64dbg-mcp",
+          asset.name,
+        );
+        await ctx.logger.task(
+          `Download ${target.label} plugin (${asset.tag})`,
+          () =>
+            downloadFile(asset.url, download, {
+              sha256: asset.sha256,
+            }),
+        );
+        await copyFile(download, destination);
+      }
+      placed.push(destination);
 
-      // Make the HTTP server start on launch, so the client connects without the
-      // user having to click Plugins -> MCP Server -> Start MCP HTTP Server.
-      const cfg = await enableAutoStart(pluginConfigDir(pluginsDir, asset.name));
-      if (cfg) {
-        placed.push(cfg);
+      const config = await enableAutoStart(
+        pluginConfigDir(pluginsDir, target.assetName),
+      );
+      if (config) {
+        placed.push(config);
       } else {
         notes.push(
-          `Could not write the ${t.label} plugin config — the MCP server will not auto-start. Enable it via Plugins -> MCP Server -> Start MCP HTTP Server, or set features.auto_start_mcp_on_plugin_load=true in the plugin's config.json.`,
+          `Could not write the ${target.label} plugin auto-start config.`,
         );
       }
     }
 
-    if (placed.length === 0 && !ctx.dryRun) {
+    if (!placed.some((file) => /\.dp(?:32|64)$/i.test(file))) {
       throw new Error(
-        "No x64dbg plugin was placed — check that the x64dbg release folder has x64/ or x32/ subfolders.",
+        "No x64dbg MCP plugin was placed; the managed snapshot has neither x64 nor x32 targets.",
       );
     }
 
+    const remote = await ctx.logger.task(
+      "Install managed mcp-remote bridge",
+      () =>
+        ensureManagedNpmPackage(ctx, {
+          nodePath,
+          packageName: "mcp-remote",
+          version: MCP_REMOTE_VERSION,
+          installDir: remoteInstallDir,
+          entryRelativePath: path.join("dist", "proxy.js"),
+        }),
+    );
+    placed.push(remote.entryPath, remote.packageJsonPath);
+
     return {
       servers: {
-        x64dbg: { type: "http", url: `http://127.0.0.1:${PORT}/mcp` },
+        x64dbg: {
+          type: "http",
+          url: `http://127.0.0.1:${PORT}/mcp`,
+        },
       },
       placedFiles: placed,
       notes,
@@ -221,18 +307,53 @@ export const x64dbgRecipe: Recipe = {
   },
 
   postInstallNotes: [
-    "Launch x64dbg (64-bit) or x32dbg (32-bit). This installer enabled auto-start, so the plugin brings up the MCP server on 127.0.0.1:3000 automatically at startup — no menu action needed. The Log tab should show 'MCP HTTP Server started'.",
-    "The server only responds while x64dbg is open, and returns live data once you load a target. To disable auto-start, set features.auto_start_mcp_on_plugin_load=false in <x64dbg>/release/<arch>/plugins/<arch>dbg-mcp/config.json (or just start it manually via Plugins -> MCP Server -> Start MCP HTTP Server).",
-    "Memory writes, register writes and script execution are OFF by default. Opt in via the plugin's config.json only if you need them.",
-    "For stdio-only clients, this installer bridges the HTTP URL through `npx mcp-remote` automatically (Claude Desktop). Other clients connect to the URL directly.",
-    "Run x64dbg inside a VM/sandbox when analysing untrusted binaries — you are giving an AI live debugger control.",
+    "Launch x64dbg or x32dbg from the managed release directory. The MCP HTTP server auto-starts on 127.0.0.1:3000.",
+    "Memory writes, register writes and script execution remain disabled by default in the managed plugin config.",
+    "stdio-only clients use the fixed managed mcp-remote@0.1.38 installation; no npx download is needed at client startup.",
+    "Run x64dbg in a VM or sandbox when analysing untrusted binaries.",
   ],
 
   async verify(ctx: InstallContext): Promise<boolean> {
-    const root = path.join(ctx.toolsDir, "x64dbg", "release");
+    const layout = managedLayout(ctx.toolsDir);
+    const root = path.join(layout.tools, "x64dbg", "release");
+    const x64Plugin = path.join(
+      root,
+      "x64",
+      "plugins",
+      "x64dbg_mcp.dp64",
+    );
+    const x32Plugin = path.join(
+      root,
+      "x32",
+      "plugins",
+      "x32dbg_mcp.dp32",
+    );
+    const x64Config = path.join(
+      root,
+      "x64",
+      "plugins",
+      "x64dbg-mcp",
+      "config.json",
+    );
+    const x32Config = path.join(
+      root,
+      "x32",
+      "plugins",
+      "x32dbg-mcp",
+      "config.json",
+    );
     return (
-      (await exists(path.join(root, "x64", "plugins"))) ||
-      (await exists(path.join(root, "x32", "plugins")))
+      ((await exists(path.join(root, "x64", "x64dbg.exe"))) ||
+        (await exists(path.join(root, "x32", "x32dbg.exe")))) &&
+      ((await exists(x64Plugin)) || (await exists(x32Plugin))) &&
+      ((await exists(x64Config)) || (await exists(x32Config))) &&
+      (await exists(
+        path.join(layout.tools, "x64dbg", ".remcp-complete"),
+      )) &&
+      (await exists(mcpRemoteEntry(ctx))) &&
+      (await exists(
+        path.join(layout.servers, "mcp-remote", ".remcp-complete"),
+      ))
     );
   },
 };

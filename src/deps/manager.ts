@@ -15,9 +15,9 @@ export interface DepResolution {
 
 /**
  * Ensure a set of dependencies are present. With `autoInstallDeps` on, missing
- * ones are installed (winget/scripts); otherwise we detect and return manual
- * guidance. Results are cached on the context so recipes sharing a dep (e.g.
- * JDK 21 for both Ghidra and jadx) don't re-detect or re-install.
+ * ones are installed into the managed shared root; otherwise we detect and
+ * return manual guidance. Results are cached on the context so recipes sharing
+ * a dep (e.g. JDK 21 for both Ghidra and jadx) don't re-detect or re-install.
  */
 export async function ensureDependencies(
   ctx: InstallContext,
@@ -53,7 +53,9 @@ export async function ensureDependencies(
 
     if (!ctx.autoInstallDeps || ctx.dryRun) {
       ctx.logger.warn(
-        `${dep.name} is missing. ${ctx.dryRun ? "(dry-run) " : ""}Auto-install is off — install it manually:`,
+        ctx.dryRun && ctx.autoInstallDeps
+          ? `${dep.name} is missing. (dry-run) A real install would download it into ${ctx.toolsDir}; no files were changed.`
+          : `${dep.name} is missing. Auto-install is off — install it manually:`,
       );
       for (const s of dep.manualSteps) ctx.logger.detail(`- ${s}`);
       results.push({
@@ -78,7 +80,7 @@ export async function ensureDependencies(
         );
       } else {
         ctx.logger.warn(
-          `${dep.name} still not detected after install — you may need to restart your terminal so PATH updates take effect.`,
+          `${dep.name} was not usable after installation in ${ctx.toolsDir}.`,
         );
       }
       results.push({
