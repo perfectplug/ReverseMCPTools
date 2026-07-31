@@ -13,6 +13,7 @@ import {
   ensureDir,
   exists,
   readText,
+  renameWithRetry,
   writeText,
 } from "../core/fs-utils.js";
 import { managedEnv, managedLayout } from "../core/layout.js";
@@ -75,12 +76,12 @@ async function promoteManagedDirectory(
   await ensureDir(path.dirname(destination));
   const backup = `${destination}.replace-${process.pid}-${randomUUID()}`;
   const hadDestination = await exists(destination);
-  if (hadDestination) await fsp.rename(destination, backup);
+  if (hadDestination) await renameWithRetry(destination, backup);
   try {
-    await fsp.rename(stagingDir, destination);
+    await renameWithRetry(stagingDir, destination);
   } catch (error) {
     if (hadDestination) {
-      await fsp.rename(backup, destination).catch(() => undefined);
+      await renameWithRetry(backup, destination).catch(() => undefined);
     }
     throw error;
   }

@@ -19,6 +19,54 @@ export async function exists(p: string): Promise<boolean> {
   }
 }
 
+export interface RenameRetryOptions {
+  /** Total rename attempts, including the first. */
+  attempts?: number;
+  /** Initial retry delay. */
+  baseDelayMs?: number;
+  /** Maximum delay between attempts. */
+  maxDelayMs?: number;
+}
+
+const RETRYABLE_RENAME_CODES = new Set([
+  "EACCES",
+  "EBUSY",
+  "ENOTEMPTY",
+  "EPERM",
+]);
+
+/**
+ * Rename with bounded backoff for transient Windows file locks. Antivirus and
+ * executable-image cleanup can briefly keep a freshly validated runtime tree
+ * open even after the child process has exited.
+ */
+export async function renameWithRetry(
+  source: string,
+  destination: string,
+  opts: RenameRetryOptions = {},
+): Promise<void> {
+  const attempts = Math.max(1, opts.attempts ?? 10);
+  const baseDelayMs = Math.max(1, opts.baseDelayMs ?? 150);
+  const maxDelayMs = Math.max(baseDelayMs, opts.maxDelayMs ?? 1_500);
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      await fsp.rename(source, destination);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "";
+      if (
+        attempt + 1 >= attempts ||
+        !RETRYABLE_RENAME_CODES.has(code)
+      ) {
+        throw error;
+      }
+      const delayMs = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 /** Read a JSON file, tolerating BOM and comments-free JSONC-ish trailing commas. */
 export async function readJsonSafe<T = unknown>(
   file: string,

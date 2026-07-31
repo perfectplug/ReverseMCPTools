@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { managedLayout } from "../dist/core/layout.js";
+import { ensureDependencies } from "../dist/deps/manager.js";
 import { DEPENDENCIES } from "../dist/deps/registry.js";
 
 const silentLogger = {
@@ -103,4 +104,36 @@ test("managed runtime detection requires completion markers and complete SDK tre
   } finally {
     await fsp.rm(scratch, { recursive: true, force: true });
   }
+});
+
+test("a failed dependency install is not repeated in the same run", async () => {
+  let runCalls = 0;
+  const ctx = {
+    platform: "win32",
+    arch: "x64",
+    toolsDir: path.join(os.tmpdir(), "remcp-no-duplicate-install"),
+    home: os.tmpdir(),
+    logger: silentLogger,
+    dryRun: false,
+    autoInstallDeps: true,
+    run: async () => {
+      runCalls += 1;
+      return { code: 1, stdout: "", stderr: "", ok: false };
+    },
+    depStatus: new Map([
+      [
+        "node2212",
+        {
+          installed: false,
+          installAttempted: true,
+          detail: "Auto-install failed earlier",
+        },
+      ],
+    ]),
+  };
+
+  const [result] = await ensureDependencies(ctx, ["node2212"]);
+  assert.equal(result.satisfied, false);
+  assert.equal(result.installed, false);
+  assert.equal(runCalls, 0);
 });

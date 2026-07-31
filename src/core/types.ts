@@ -38,6 +38,8 @@ export function isStdioServer(
 
 export interface DepStatus {
   installed: boolean;
+  /** This CLI run already attempted installation; avoid repeating a failed download/extract. */
+  installAttempted?: boolean;
   /** Best-effort detected version string, e.g. "21.0.2". */
   version?: string;
   /** Resolved path to the binary / install root when known. */

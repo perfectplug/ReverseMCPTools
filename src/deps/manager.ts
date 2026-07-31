@@ -51,6 +51,21 @@ export async function ensureDependencies(
 
     if (status.detail) ctx.logger.warn(status.detail);
 
+    if (status.installAttempted) {
+      ctx.logger.warn(
+        `${dep.name} installation already failed earlier in this run; skipping a duplicate attempt.`,
+      );
+      results.push({
+        id,
+        name: dep.name,
+        status,
+        satisfied: false,
+        installed: false,
+        manualSteps: dep.manualSteps,
+      });
+      continue;
+    }
+
     if (!ctx.autoInstallDeps || ctx.dryRun) {
       ctx.logger.warn(
         ctx.dryRun && ctx.autoInstallDeps
@@ -73,7 +88,8 @@ export async function ensureDependencies(
     try {
       await dep.install(ctx);
       const after = await dep.detect(ctx);
-      ctx.depStatus.set(id, after);
+      const recorded = { ...after, installAttempted: true };
+      ctx.depStatus.set(id, recorded);
       if (after.installed) {
         ctx.logger.success(
           `Installed ${dep.name}${after.version ? ` (${after.version})` : ""}`,
@@ -86,20 +102,28 @@ export async function ensureDependencies(
       results.push({
         id,
         name: dep.name,
-        status: after,
+        status: recorded,
         satisfied: after.installed,
         installed: true,
         manualSteps: dep.manualSteps,
       });
     } catch (err) {
+      const message = (err as Error).message;
       ctx.logger.error(
-        `Auto-install of ${dep.name} failed: ${(err as Error).message}`,
+        `Auto-install of ${dep.name} failed: ${message}`,
       );
+      const failedStatus: DepStatus = {
+        ...status,
+        installed: false,
+        installAttempted: true,
+        detail: `Auto-install failed: ${message}`,
+      };
+      ctx.depStatus.set(id, failedStatus);
       for (const s of dep.manualSteps) ctx.logger.detail(`- ${s}`);
       results.push({
         id,
         name: dep.name,
-        status,
+        status: failedStatus,
         satisfied: false,
         installed: false,
         manualSteps: dep.manualSteps,

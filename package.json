@@ -1,6 +1,6 @@
 {
   "name": "reverse-mcp-tools",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "One-click installer for reverse-engineering MCP servers (Ghidra, JADX, x64dbg, jshook/Frida) into your MCP clients.",
   "type": "module",
   "bin": {

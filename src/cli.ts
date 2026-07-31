@@ -230,7 +230,7 @@ export async function main(argv: string[]): Promise<void> {
     .description(
       "One-click installer for reverse-engineering MCP servers (Ghidra, JADX, x64dbg, jshook).",
     )
-    .version("0.2.1")
+    .version("0.2.2")
     .option(
       "--tools-dir <path>",
       "shared root for all managed SDKs, binaries, MCP servers and caches (or REMCP_TOOLS_DIR)",
